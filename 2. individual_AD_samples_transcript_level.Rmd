@@ -1,0 +1,711 @@
+---
+title: "Individual transcript level seurat AD"
+author: "Dev Raj Bhattarai"
+date: '2025-01-15'
+output: html_document
+---
+
+```{r}
+setwd("/data/project/rizzardilab/drbhatta/long_read/AD_EDA")
+```
+
+```{r}
+library(Seurat)
+library(data.table)
+library(dplyr)
+```
+
+```{r}
+sample_info <- read.csv("AD_sequencing_result.csv", stringsAsFactors = FALSE)
+```
+
+```{r}
+# Reading merged Seurat object
+merged_seurat <- readRDS("AD_main_merged_seurat_obj_gene_level.rds")
+
+# sample ID "1238"
+sample_id <- "1238"
+
+# Getting file path for this sample from sample_info
+file_path <- sample_info$directory_for_long_read_counts[
+    sample_info$id_column_in_short_read_metadata == sample_id]
+
+# Getting valid cells for this sample from merged object
+valid_cells <- colnames(merged_seurat)[merged_seurat$long_read_sample_id == sample_id]
+valid_cells_clean <- sub(paste0(sample_id, "_"), "", valid_cells)
+
+# Reading transcript counts
+counts <- fread(file_path, sep = "\t", header = TRUE, data.table = FALSE)
+rownames(counts) <- counts[[1]]
+counts <- counts[,-1]
+
+# Keeping only cells that exist in merged object
+common_cells <- intersect(colnames(counts), valid_cells_clean)
+if(length(common_cells) > 0) {
+    counts <- counts[, common_cells, drop = FALSE]
+    # Adding sample prefix to match merged object format
+    colnames(counts) <- paste0(sample_id, "_", colnames(counts))
+    
+    # Creating Seurat object
+    seurat_obj <- CreateSeuratObject(counts = as.sparse(as.matrix(counts)))
+    
+    # Adding metadata from merged object
+    seurat_obj <- AddMetaData(
+        object = seurat_obj,
+        metadata = merged_seurat@meta.data[colnames(seurat_obj), ]
+    )
+}
+
+# Printing summary
+cat(sprintf("\nSample %s summary:\n", sample_id))
+cat(sprintf("Total cells in merged object for this sample: %d\n", length(valid_cells)))
+cat(sprintf("Cells with transcript data: %d\n", ncol(seurat_obj)))
+cat(sprintf("Total transcripts: %d\n", nrow(seurat_obj)))
+
+# Saving individual object
+saveRDS(seurat_obj, paste0("transcript_seurat_", sample_id, ".rds"))
+```
+
+```{r}
+# Sample IDs for HctZZT and HCT17HEX
+sample_ids <- c("HCTZZT", "HCT17HEX")
+
+# Getting file paths for both runs
+sample_files <- sample_info$directory_for_long_read_counts[
+    grep(paste(sample_ids, collapse="|"), 
+         sample_info$id_column_in_short_read_metadata)]
+
+cat("Processing files:\n")
+print(basename(sample_files))
+
+# Combining counts from both runs
+combined_counts <- NULL
+for(file in sample_files) {
+    counts <- fread(file, sep = "\t", header = TRUE, data.table = FALSE)
+    if(is.null(combined_counts)) {
+        combined_counts <- counts
+    } else {
+        # Add counts from additional run
+        common_rows <- intersect(combined_counts[[1]], counts[[1]])
+        common_cols <- intersect(colnames(combined_counts), colnames(counts))
+        for(col in common_cols[-1]) {
+            combined_counts[match(common_rows, combined_counts[[1]]), col] <- 
+                combined_counts[match(common_rows, combined_counts[[1]]), col] +
+                counts[match(common_rows, counts[[1]]), col]
+        }
+    }
+}
+
+# Processing each sample from the combined counts
+seurat_objects <- list()
+for(sample_id in sample_ids) {
+    cat(sprintf("\nProcessing sample %s\n", sample_id))
+    
+    # Getting valid cells for this sample from merged object
+    valid_cells <- colnames(merged_seurat)[merged_seurat$long_read_sample_id == sample_id]
+    valid_cells_clean <- sub(paste0(sample_id, "_"), "", valid_cells)
+    
+    # Processing combined counts
+    counts <- combined_counts
+    rownames(counts) <- counts[[1]]
+    counts <- counts[,-1]
+    
+    # Keeping only cells that exist in merged object
+    common_cells <- intersect(colnames(counts), valid_cells_clean)
+    if(length(common_cells) > 0) {
+        sample_counts <- counts[, common_cells, drop = FALSE]
+        # Adding sample prefix to match merged object format
+        colnames(sample_counts) <- paste0(sample_id, "_", colnames(sample_counts))
+        
+        # Creating Seurat object
+        seurat_obj <- CreateSeuratObject(counts = as.sparse(as.matrix(sample_counts)))
+        
+        # Adding metadata from merged object
+        seurat_obj <- AddMetaData(
+            object = seurat_obj,
+            metadata = merged_seurat@meta.data[colnames(seurat_obj), ]
+        )
+        
+        seurat_objects[[sample_id]] <- seurat_obj
+        
+        # Printing summary for this sample
+        cat(sprintf("  Total cells in merged object: %d\n", length(valid_cells)))
+        cat(sprintf("  Cells with transcript data: %d\n", ncol(seurat_obj)))
+        cat(sprintf("  Total transcripts: %d\n", nrow(seurat_obj)))
+        
+        # Save individual object
+        saveRDS(seurat_obj, paste0("transcript_seurat_", sample_id, ".rds"))
+    }
+}
+```
+
+```{r}
+# Sample IDs for 4305 and 4443
+sample_ids <- c("4305", "4443")
+
+# Getting file paths for both runs
+sample_files <- sample_info$directory_for_long_read_counts[
+    grep(paste(sample_ids, collapse="|"), 
+         sample_info$id_column_in_short_read_metadata)]
+
+cat("Processing files:\n")
+print(basename(sample_files))
+
+# Combining counts from both runs
+combined_counts <- NULL
+for(file in sample_files) {
+    counts <- fread(file, sep = "\t", header = TRUE, data.table = FALSE)
+    if(is.null(combined_counts)) {
+        combined_counts <- counts
+    } else {
+        # Adding counts from additional run
+        common_rows <- intersect(combined_counts[[1]], counts[[1]])
+        common_cols <- intersect(colnames(combined_counts), colnames(counts))
+        for(col in common_cols[-1]) {
+            combined_counts[match(common_rows, combined_counts[[1]]), col] <- 
+                combined_counts[match(common_rows, combined_counts[[1]]), col] +
+                counts[match(common_rows, counts[[1]]), col]
+        }
+    }
+}
+
+# Processing each sample from the combined counts
+seurat_objects <- list()
+for(sample_id in sample_ids) {
+    cat(sprintf("\nProcessing sample %s\n", sample_id))
+    
+    # Getting valid cells for this sample from merged object
+    valid_cells <- colnames(merged_seurat)[merged_seurat$long_read_sample_id == sample_id]
+    valid_cells_clean <- sub(paste0(sample_id, "_"), "", valid_cells)
+    
+    # Processing combined counts
+    counts <- combined_counts
+    rownames(counts) <- counts[[1]]
+    counts <- counts[,-1]
+    
+    # Keeping only cells that exist in merged object
+    common_cells <- intersect(colnames(counts), valid_cells_clean)
+    if(length(common_cells) > 0) {
+        sample_counts <- counts[, common_cells, drop = FALSE]
+        # Adding sample prefix to match merged object format
+        colnames(sample_counts) <- paste0(sample_id, "_", colnames(sample_counts))
+        
+        # Creating Seurat object
+        seurat_obj <- CreateSeuratObject(counts = as.sparse(as.matrix(sample_counts)))
+        
+        # Adding metadata from merged object
+        seurat_obj <- AddMetaData(
+            object = seurat_obj,
+            metadata = merged_seurat@meta.data[colnames(seurat_obj), ]
+        )
+        
+        seurat_objects[[sample_id]] <- seurat_obj
+        
+        # Printing summary for this sample
+        cat(sprintf("  Total cells in merged object: %d\n", length(valid_cells)))
+        cat(sprintf("  Cells with transcript data: %d\n", ncol(seurat_obj)))
+        cat(sprintf("  Total transcripts: %d\n", nrow(seurat_obj)))
+        
+        # Saving individual object
+        saveRDS(seurat_obj, paste0("transcript_seurat_", sample_id, ".rds"))
+    }
+}
+
+# Printing overall summary
+cat("\nOverall summary:\n")
+for(sample_id in names(seurat_objects)) {
+    cat(sprintf("Sample %s:\n", sample_id))
+    cat(sprintf("  Cells: %d\n", ncol(seurat_objects[[sample_id]])))
+    cat(sprintf("  Transcripts: %d\n", nrow(seurat_objects[[sample_id]])))
+    cat(sprintf("  Metadata columns: %d\n", 
+                ncol(seurat_objects[[sample_id]]@meta.data)))
+}
+```
+
+```{r}
+# Sample IDs for 4482 and 4313
+sample_ids <- c("4482", "4313")
+
+# Getting file paths for both runs
+sample_files <- sample_info$directory_for_long_read_counts[
+    grep(paste(sample_ids, collapse="|"), 
+         sample_info$id_column_in_short_read_metadata)]
+
+cat("Processing files:\n")
+print(basename(sample_files))
+
+# Combining counts from both runs
+combined_counts <- NULL
+for(file in sample_files) {
+    counts <- fread(file, sep = "\t", header = TRUE, data.table = FALSE)
+    if(is.null(combined_counts)) {
+        combined_counts <- counts
+    } else {
+        # Adding counts from additional run
+        common_rows <- intersect(combined_counts[[1]], counts[[1]])
+        common_cols <- intersect(colnames(combined_counts), colnames(counts))
+        for(col in common_cols[-1]) {
+            combined_counts[match(common_rows, combined_counts[[1]]), col] <- 
+                combined_counts[match(common_rows, combined_counts[[1]]), col] +
+                counts[match(common_rows, counts[[1]]), col]
+        }
+    }
+}
+
+# Processing each sample from the combined counts
+seurat_objects <- list()
+for(sample_id in sample_ids) {
+    cat(sprintf("\nProcessing sample %s\n", sample_id))
+    
+    # Getting valid cells for this sample from merged object
+    valid_cells <- colnames(merged_seurat)[merged_seurat$long_read_sample_id == sample_id]
+    valid_cells_clean <- sub(paste0(sample_id, "_"), "", valid_cells)
+    
+    # Processing combined counts
+    counts <- combined_counts
+    rownames(counts) <- counts[[1]]
+    counts <- counts[,-1]
+    
+    # Keeping only cells that exist in merged object
+    common_cells <- intersect(colnames(counts), valid_cells_clean)
+    if(length(common_cells) > 0) {
+        sample_counts <- counts[, common_cells, drop = FALSE]
+        # Adding sample prefix to match merged object format
+        colnames(sample_counts) <- paste0(sample_id, "_", colnames(sample_counts))
+        
+        # Creating Seurat object
+        seurat_obj <- CreateSeuratObject(counts = as.sparse(as.matrix(sample_counts)))
+        
+        # Adding metadata from merged object
+        seurat_obj <- AddMetaData(
+            object = seurat_obj,
+            metadata = merged_seurat@meta.data[colnames(seurat_obj), ]
+        )
+        
+        seurat_objects[[sample_id]] <- seurat_obj
+        
+        # Printing summary for this sample
+        cat(sprintf("  Total cells in merged object: %d\n", length(valid_cells)))
+        cat(sprintf("  Cells with transcript data: %d\n", ncol(seurat_obj)))
+        cat(sprintf("  Total transcripts: %d\n", nrow(seurat_obj)))
+        
+        # Saving individual object
+        saveRDS(seurat_obj, paste0("transcript_seurat_", sample_id, ".rds"))
+    }
+}
+
+# Printing overall summary
+cat("\nOverall summary:\n")
+for(sample_id in names(seurat_objects)) {
+    cat(sprintf("Sample %s:\n", sample_id))
+    cat(sprintf("  Cells: %d\n", ncol(seurat_objects[[sample_id]])))
+    cat(sprintf("  Transcripts: %d\n", nrow(seurat_objects[[sample_id]])))
+    cat(sprintf("  Metadata columns: %d\n", 
+                ncol(seurat_objects[[sample_id]]@meta.data)))
+}
+```
+
+```{r}
+# Sample ID
+sample_id <- "3329"
+
+# Getting file path for this sample from sample_info
+file_path <- sample_info$directory_for_long_read_counts[
+    grep("3329_HBQS", sample_info$directory_for_long_read_counts)]
+
+cat(sprintf("Processing file: %s\n", basename(file_path)))
+
+# Getting valid cells for this sample from merged object
+valid_cells <- colnames(merged_seurat)[merged_seurat$long_read_sample_id == sample_id]
+valid_cells_clean <- sub(paste0(sample_id, "_"), "", valid_cells)
+
+# Reading transcript counts
+counts <- fread(file_path, sep = "\t", header = TRUE, data.table = FALSE)
+rownames(counts) <- counts[[1]]
+counts <- counts[,-1]
+
+# Keeping only cells that exist in merged object
+common_cells <- intersect(colnames(counts), valid_cells_clean)
+if(length(common_cells) > 0) {
+    counts <- counts[, common_cells, drop = FALSE]
+    # Adding sample prefix to match merged object format
+    colnames(counts) <- paste0(sample_id, "_", colnames(counts))
+    
+    # Creating Seurat object
+    seurat_obj <- CreateSeuratObject(counts = as.sparse(as.matrix(counts)))
+    
+    # Adding metadata from merged object
+    seurat_obj <- AddMetaData(
+        object = seurat_obj,
+        metadata = merged_seurat@meta.data[colnames(seurat_obj), ]
+    )
+}
+
+# Printing summary
+cat(sprintf("\nSample %s summary:\n", sample_id))
+cat(sprintf("Total cells in merged object for this sample: %d\n", length(valid_cells)))
+cat(sprintf("Cells with transcript data: %d\n", ncol(seurat_obj)))
+cat(sprintf("Total transcripts: %d\n", nrow(seurat_obj)))
+
+# Saving individual object
+saveRDS(seurat_obj, paste0("transcript_seurat_", sample_id, ".rds"))
+```
+
+```{r}
+# Sample ID
+sample_id <- "NT1261"
+
+# Geting file path for this sample from sample_info
+file_path <- sample_info$directory_for_long_read_counts[
+    grep("NT1261_BEB18034", sample_info$directory_for_long_read_counts)]
+
+cat(sprintf("Processing file: %s\n", basename(file_path)))
+
+# Getting valid cells for this sample from merged object
+valid_cells <- colnames(merged_seurat)[merged_seurat$long_read_sample_id == sample_id]
+valid_cells_clean <- sub(paste0(sample_id, "_"), "", valid_cells)
+
+# Reading transcript counts
+counts <- fread(file_path, sep = "\t", header = TRUE, data.table = FALSE)
+rownames(counts) <- counts[[1]]
+counts <- counts[,-1]
+
+# Keeping only cells that exist in merged object
+common_cells <- intersect(colnames(counts), valid_cells_clean)
+if(length(common_cells) > 0) {
+    counts <- counts[, common_cells, drop = FALSE]
+    # Adding sample prefix to match merged object format
+    colnames(counts) <- paste0(sample_id, "_", colnames(counts))
+    
+    # Creating Seurat object
+    seurat_obj <- CreateSeuratObject(counts = as.sparse(as.matrix(counts)))
+    
+    # Adding metadata from merged object
+    seurat_obj <- AddMetaData(
+        object = seurat_obj,
+        metadata = merged_seurat@meta.data[colnames(seurat_obj), ]
+    )
+}
+
+# Printing summary
+cat(sprintf("\nSample %s summary:\n", sample_id))
+cat(sprintf("Total cells in merged object for this sample: %d\n", length(valid_cells)))
+cat(sprintf("Cells with transcript data: %d\n", ncol(seurat_obj)))
+cat(sprintf("Total transcripts: %d\n", nrow(seurat_obj)))
+
+# Saving individual object
+saveRDS(seurat_obj, paste0("transcript_seurat_", sample_id, ".rds"))
+```
+
+```{r}
+# Sample ID
+sample_id <- "1230"
+
+# Getting file path for this sample from sample_info
+file_path <- sample_info$directory_for_long_read_counts[
+    grep("1230_BEB19157", sample_info$directory_for_long_read_counts)]
+
+cat(sprintf("Processing file: %s\n", basename(file_path)))
+
+# Getting valid cells for this sample from merged object
+valid_cells <- colnames(merged_seurat)[merged_seurat$long_read_sample_id == sample_id]
+valid_cells_clean <- sub(paste0(sample_id, "_"), "", valid_cells)
+
+# Reading transcript counts
+counts <- fread(file_path, sep = "\t", header = TRUE, data.table = FALSE)
+rownames(counts) <- counts[[1]]
+counts <- counts[,-1]
+
+# Keeping only cells that exist in merged object
+common_cells <- intersect(colnames(counts), valid_cells_clean)
+if(length(common_cells) > 0) {
+    counts <- counts[, common_cells, drop = FALSE]
+    # Adding sample prefix to match merged object format
+    colnames(counts) <- paste0(sample_id, "_", colnames(counts))
+    
+    # Creating Seurat object
+    seurat_obj <- CreateSeuratObject(counts = as.sparse(as.matrix(counts)))
+    
+    # Adding metadata from merged object
+    seurat_obj <- AddMetaData(
+        object = seurat_obj,
+        metadata = merged_seurat@meta.data[colnames(seurat_obj), ]
+    )
+}
+
+# Printing summary
+cat(sprintf("\nSample %s summary:\n", sample_id))
+cat(sprintf("Total cells in merged object for this sample: %d\n", length(valid_cells)))
+cat(sprintf("Cells with transcript data: %d\n", ncol(seurat_obj)))
+cat(sprintf("Total transcripts: %d\n", nrow(seurat_obj)))
+
+# Saving individual object
+saveRDS(seurat_obj, paste0("transcript_seurat_", sample_id, ".rds"))
+```
+
+```{r}
+# Sample ID
+sample_id <- "NT1271"
+
+# Geting file path for this sample from sample_info
+file_path <- sample_info$directory_for_long_read_counts[
+    grep("BEB18062_NT1271", sample_info$directory_for_long_read_counts)]
+
+cat(sprintf("Processing file: %s\n", basename(file_path)))
+
+# Getting valid cells for this sample from merged object
+valid_cells <- colnames(merged_seurat)[merged_seurat$long_read_sample_id == sample_id]
+valid_cells_clean <- sub(paste0(sample_id, "_"), "", valid_cells)
+
+# Reading transcript counts
+counts <- fread(file_path, sep = "\t", header = TRUE, data.table = FALSE)
+rownames(counts) <- counts[[1]]
+counts <- counts[,-1]
+
+# Keeping only cells that exist in merged object
+common_cells <- intersect(colnames(counts), valid_cells_clean)
+if(length(common_cells) > 0) {
+    counts <- counts[, common_cells, drop = FALSE]
+    # Adding sample prefix to match merged object format
+    colnames(counts) <- paste0(sample_id, "_", colnames(counts))
+    
+    # Creating Seurat object
+    seurat_obj <- CreateSeuratObject(counts = as.sparse(as.matrix(counts)))
+    
+    # Adding metadata from merged object
+    seurat_obj <- AddMetaData(
+        object = seurat_obj,
+        metadata = merged_seurat@meta.data[colnames(seurat_obj), ]
+    )
+}
+
+# Printing summary
+cat(sprintf("\nSample %s summary:\n", sample_id))
+cat(sprintf("Total cells in merged object for this sample: %d\n", length(valid_cells)))
+cat(sprintf("Cells with transcript data: %d\n", ncol(seurat_obj)))
+cat(sprintf("Total transcripts: %d\n", nrow(seurat_obj)))
+
+# Saving individual object
+saveRDS(seurat_obj, paste0("transcript_seurat_", sample_id, ".rds"))
+```
+
+```{r}
+# Sample ID
+sample_id <- "4627"
+
+# Getting file path for this sample from sample_info
+file_path <- sample_info$directory_for_long_read_counts[
+    grep("4627_AD_1", sample_info$directory_for_long_read_counts)]
+
+cat(sprintf("Processing file: %s\n", basename(file_path)))
+
+# Getting valid cells for this sample from merged object
+valid_cells <- colnames(merged_seurat)[merged_seurat$long_read_sample_id == sample_id]
+valid_cells_clean <- sub(paste0(sample_id, "_"), "", valid_cells)
+
+# Reading transcript counts
+counts <- fread(file_path, sep = "\t", header = TRUE, data.table = FALSE)
+rownames(counts) <- counts[[1]]
+counts <- counts[,-1]
+
+# Keeping only cells that exist in merged object
+common_cells <- intersect(colnames(counts), valid_cells_clean)
+if(length(common_cells) > 0) {
+    counts <- counts[, common_cells, drop = FALSE]
+    # Adding sample prefix to match merged object format
+    colnames(counts) <- paste0(sample_id, "_", colnames(counts))
+    
+    # Creating Seurat object
+    seurat_obj <- CreateSeuratObject(counts = as.sparse(as.matrix(counts)))
+    
+    # Adding metadata from merged object
+    seurat_obj <- AddMetaData(
+        object = seurat_obj,
+        metadata = merged_seurat@meta.data[colnames(seurat_obj), ]
+    )
+}
+
+# Printing summary
+cat(sprintf("\nSample %s summary:\n", sample_id))
+cat(sprintf("Total cells in merged object for this sample: %d\n", length(valid_cells)))
+cat(sprintf("Cells with transcript data: %d\n", ncol(seurat_obj)))
+cat(sprintf("Total transcripts: %d\n", nrow(seurat_obj)))
+
+# Saving individual object
+saveRDS(seurat_obj, paste0("transcript_seurat_", sample_id, ".rds"))
+```
+
+```{r}
+# Sample ID
+sample_id <- "1224"
+
+# Getting file path for this sample from sample_info
+file_path <- sample_info$directory_for_long_read_counts[
+    grep("1224_Ctrl_1", sample_info$directory_for_long_read_counts)]
+
+cat(sprintf("Processing file: %s\n", basename(file_path)))
+
+# Geting valid cells for this sample from merged object
+valid_cells <- colnames(merged_seurat)[merged_seurat$long_read_sample_id == sample_id]
+valid_cells_clean <- sub(paste0(sample_id, "_"), "", valid_cells)
+
+# Reading transcript counts
+counts <- fread(file_path, sep = "\t", header = TRUE, data.table = FALSE)
+rownames(counts) <- counts[[1]]
+counts <- counts[,-1]
+
+# Keeping only cells that exist in merged object
+common_cells <- intersect(colnames(counts), valid_cells_clean)
+if(length(common_cells) > 0) {
+    counts <- counts[, common_cells, drop = FALSE]
+    # Adding sample prefix to match merged object format
+    colnames(counts) <- paste0(sample_id, "_", colnames(counts))
+    
+    # Creating Seurat object
+    seurat_obj <- CreateSeuratObject(counts = as.sparse(as.matrix(counts)))
+    
+    # Adding metadata from merged object
+    seurat_obj <- AddMetaData(
+        object = seurat_obj,
+        metadata = merged_seurat@meta.data[colnames(seurat_obj), ]
+    )
+}
+
+# Printing summary
+cat(sprintf("\nSample %s summary:\n", sample_id))
+cat(sprintf("Total cells in merged object for this sample: %d\n", length(valid_cells)))
+cat(sprintf("Cells with transcript data: %d\n", ncol(seurat_obj)))
+cat(sprintf("Total transcripts: %d\n", nrow(seurat_obj)))
+
+# Saving individual object
+saveRDS(seurat_obj, paste0("transcript_seurat_", sample_id, ".rds"))
+```
+
+
+```{r}
+# Sample ID
+sample_id <- "3586"
+
+# Geting file path for this sample from sample_info
+file_path <- sample_info$directory_for_long_read_counts[
+    grep("3586_Ctrl_1", sample_info$directory_for_long_read_counts)]
+
+cat(sprintf("Processing file: %s\n", basename(file_path)))
+
+# Geting valid cells for this sample from merged object
+valid_cells <- colnames(merged_seurat)[merged_seurat$long_read_sample_id == sample_id]
+valid_cells_clean <- sub(paste0(sample_id, "_"), "", valid_cells)
+
+# Reading transcript counts
+counts <- fread(file_path, sep = "\t", header = TRUE, data.table = FALSE)
+rownames(counts) <- counts[[1]]
+counts <- counts[,-1]
+
+# Keeping only cells that exist in merged object
+common_cells <- intersect(colnames(counts), valid_cells_clean)
+if(length(common_cells) > 0) {
+    counts <- counts[, common_cells, drop = FALSE]
+    # Adding sample prefix to match merged object format
+    colnames(counts) <- paste0(sample_id, "_", colnames(counts))
+    
+    # Creating Seurat object
+    seurat_obj <- CreateSeuratObject(counts = as.sparse(as.matrix(counts)))
+    
+    # Adding metadata from merged object
+    seurat_obj <- AddMetaData(
+        object = seurat_obj,
+        metadata = merged_seurat@meta.data[colnames(seurat_obj), ]
+    )
+}
+
+# Printing summary
+cat(sprintf("\nSample %s summary:\n", sample_id))
+cat(sprintf("Total cells in merged object for this sample: %d\n", length(valid_cells)))
+cat(sprintf("Cells with transcript data: %d\n", ncol(seurat_obj)))
+cat(sprintf("Total transcripts: %d\n", nrow(seurat_obj)))
+
+# Saving individual object
+saveRDS(seurat_obj, paste0("transcript_seurat_", sample_id, ".rds"))
+```
+
+```{r}
+# Sample ID
+sample_id <- "4481"
+
+# Getting file path for this sample from sample_info
+file_path <- sample_info$directory_for_long_read_counts[
+    grep("4481_AD_1", sample_info$directory_for_long_read_counts)]
+
+cat(sprintf("Processing file: %s\n", basename(file_path)))
+
+# Getting valid cells for this sample from merged object
+valid_cells <- colnames(merged_seurat)[merged_seurat$long_read_sample_id == sample_id]
+valid_cells_clean <- sub(paste0(sample_id, "_"), "", valid_cells)
+
+# Reading transcript counts
+counts <- fread(file_path, sep = "\t", header = TRUE, data.table = FALSE)
+rownames(counts) <- counts[[1]]
+counts <- counts[,-1]
+
+# Keeping only cells that exist in merged object
+common_cells <- intersect(colnames(counts), valid_cells_clean)
+if(length(common_cells) > 0) {
+    counts <- counts[, common_cells, drop = FALSE]
+    # Adding sample prefix to match merged object format
+    colnames(counts) <- paste0(sample_id, "_", colnames(counts))
+    
+    # Creating Seurat object
+    seurat_obj <- CreateSeuratObject(counts = as.sparse(as.matrix(counts)))
+    
+    # Adding metadata from merged object
+    seurat_obj <- AddMetaData(
+        object = seurat_obj,
+        metadata = merged_seurat@meta.data[colnames(seurat_obj), ]
+    )
+}
+
+# Printing summary
+cat(sprintf("\nSample %s summary:\n", sample_id))
+cat(sprintf("Total cells in merged object for this sample: %d\n", length(valid_cells)))
+cat(sprintf("Cells with transcript data: %d\n", ncol(seurat_obj)))
+cat(sprintf("Total transcripts: %d\n", nrow(seurat_obj)))
+
+# Saving individual object
+saveRDS(seurat_obj, paste0("transcript_seurat_", sample_id, ".rds"))
+```
+
+```{r}
+# List of all sample IDs
+sample_ids <- c("1224", "1230", "1238", "3329", "3586", 
+                "4305", "4313", "4443", "4481", "4482", "4627",
+                "HCT17HEX", "HCTZZT", "NT1261", "NT1271")
+
+# Reading first object to start the merge
+seurat_objects <- list()
+seurat_objects[[1]] <- readRDS(paste0("transcript_seurat_", sample_ids[1], ".rds"))
+
+# Reading and storing remaining objects
+for(i in 2:length(sample_ids)) {
+    seurat_objects[[i]] <- readRDS(paste0("transcript_seurat_", sample_ids[i], ".rds"))
+}
+
+# Merging all objects
+merged_transcript_seurat <- merge(
+    seurat_objects[[1]], 
+    y = seurat_objects[-1],
+    add.cell.ids = NULL,  # as cells already have correct IDs
+    project = "AD_transcript_level"
+)
+
+fixed_cell_names <- gsub("(.+?)_\\1_", "\\1_", colnames(merged_transcript_seurat))
+colnames(merged_transcript_seurat) <- fixed_cell_names
+
+# Printing summary
+cat("\nMerged object summary:\n")
+cat(sprintf("Total cells: %d\n", ncol(merged_transcript_seurat)))
+cat(sprintf("Total transcripts: %d\n", nrow(merged_transcript_seurat)))
+cat(sprintf("Total samples: %d\n", length(unique(merged_transcript_seurat$long_read_sample_id))))
+
+# Saving merged object
+saveRDS(merged_transcript_seurat, "AD_main_merged_seurat_obj_transcript_level.rds")
+```
