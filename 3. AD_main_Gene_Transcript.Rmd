@@ -1,0 +1,334 @@
+```{r}
+setwd("/data/project/rizzardilab/drbhatta/long_read/AD_EDA")
+```
+
+```{r}
+# Libraries
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tibble)
+```
+
+```{r}
+merged_seurat_transcript <- readRDS("AD_main_merged_seurat_obj_transcript_level.rds")
+merged_seurat_transcript <- JoinLayers(merged_seurat_transcript)
+
+merged_seurat_gene <- readRDS("AD_main_merged_seurat_obj_gene_level.rds")
+merged_seurat_gene <- JoinLayers(merged_seurat_gene)
+
+merged_seurat_gene[["TRANSCRIPT"]] <- CreateAssayObject(counts = GetAssayData(merged_seurat_transcript, slot = "counts"))
+saveRDS(merged_seurat_gene, "AD_main_merged_seurat_obj_gene_level_transcript_level.rds")
+
+AD_seurat_obj <- readRDS("AD_main_merged_seurat_obj_gene_level_transcript_level.rds")
+```
+
+
+```{r}
+DefaultAssay(AD_seurat_obj) <- "RNA"
+
+set.seed(1234)
+
+# Normalizing and scaling data
+AD_seurat_obj <- NormalizeData(AD_seurat_obj)
+AD_seurat_obj <- FindVariableFeatures(AD_seurat_obj, selection.method = "vst", nfeatures = 2000)
+AD_seurat_obj <- ScaleData(AD_seurat_obj)
+
+# Dimension reduction
+AD_seurat_obj <- RunPCA(AD_seurat_obj)
+ElbowPlot(AD_seurat_obj, ndims = 50)
+
+AD_seurat_obj <- RunUMAP(AD_seurat_obj, dims = 1:10)
+
+# Visualization
+DimPlot(AD_seurat_obj, reduction = "umap", group.by = "cluster_celltype", label = TRUE) +
+    ggtitle("Clustering by Cell Types")
+```
+```{r}
+# Setting up the analysis environment
+DefaultAssay(AD_seurat_obj) <- "TRANSCRIPT"
+
+# Converting NA cell types to "Unassigned"
+AD_seurat_obj$cluster_celltype[is.na(AD_seurat_obj$cluster_celltype)] <- "Unassigned"
+
+# Filtering out endothelial and pericyte cells
+cells_to_keep <- AD_seurat_obj$cluster_celltype != "Endothelial" & 
+                 AD_seurat_obj$cluster_celltype != "Pericytes"
+AD_seurat_obj <- AD_seurat_obj[, cells_to_keep]
+
+# Setting threshold for minimum reads
+X <- 5
+
+# Getting unique samples and cell types
+unique_samples <- unique(AD_seurat_obj$sample_id)
+unique_celltypes <- unique(AD_seurat_obj$cluster_celltype)
+
+# Initializing list to store results
+result_list <- list()
+
+# Getting the count matrix
+counts_matrix <- GetAssayData(AD_seurat_obj, slot = "counts")
+
+# Looping through each sample and cell type combination
+for (sample in unique_samples) {
+  for (ct in unique_celltypes) {
+    message(sprintf("Processing: %s - %s", sample, ct))
+    
+    cells_subset <- colnames(AD_seurat_obj)[
+      AD_seurat_obj$sample_id == sample & 
+      AD_seurat_obj$cluster_celltype == ct
+    ]
+    
+    if (length(cells_subset) == 0) next
+    
+    # Getting counts for the subset
+    subset_counts <- counts_matrix[, cells_subset, drop = FALSE]
+    
+    # Calculating coverage metrics
+    n_cells <- Matrix::rowSums(subset_counts >= X)
+    pct_cells <- 100 * (n_cells / length(cells_subset))
+    
+    result_df <- data.frame(
+      transcript = rownames(subset_counts),
+      pct_cells = pct_cells,
+      n_cells = n_cells,
+      total_cells = length(cells_subset),
+      sample = sample,
+      celltype = ct
+    )
+    
+    result_list[[paste(sample, ct, sep = "_")]] <- result_df
+  }
+}
+
+# Combining all results
+all_results <- do.call(rbind, result_list)
+
+# Visualization
+# Coverage distribution by sample and cell type
+ggplot(all_results, aes(x = celltype, y = pct_cells, fill = sample)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 12)
+  ) +
+  labs(
+    title = sprintf("Transcript Coverage Distribution (≥%d reads)", X),
+    y = "% of cells with coverage",
+    x = "Cell Type"
+  )
+```
+
+
+```{r}
+# Sequencing depth per sample
+# Getting library sizes per cell/sample
+library_sizes <- colSums(GetAssayData(AD_seurat_obj, slot = "counts"))
+
+# Creating a mapping of Sample to Status (excluding NAs)
+status_mapping <- sample_status %>%
+  filter(!is.na(Status)) %>%
+  distinct(Sample = sub("_.*", "", Sample), Status)
+
+# Now filling in the NAs using this mapping
+sample_status_fixed <- sample_status %>%
+  mutate(
+    Sample_Base = sub("_.*", "", Sample),  # Extracted base sample ID
+    Status = ifelse(is.na(Status),         # If Status is NA
+                   status_mapping$Status[match(Sample_Base, status_mapping$Sample)],  # Looking up the status
+                   Status)                  # Otherwise keeping original status
+  ) %>%
+  dplyr::select(-Sample_Base)
+
+AD_seurat_obj$Status <- sample_status_fixed$Status[match(AD_seurat_obj$sample_id, 
+                                                        sample_status_fixed$Sample)]
+
+# Creating a data frame with sample information
+sample_stats <- data.frame(
+  Sample = AD_seurat_obj$sample_id,  # Using sample_id instead of names
+  Total_Counts = library_sizes,
+  Group = AD_seurat_obj$Status,      # Using Status instead of condition
+  Cell_Type = AD_seurat_obj$cluster_celltype
+)
+
+# Visualizing the sequencing depth
+
+# Box plot of counts by group
+ggplot(sample_stats, aes(x = Group, y = Total_Counts, fill = Group)) +
+  geom_boxplot() +
+  theme_classic() +
+  ggtitle("Sequencing Depth by Disease Status") +
+  ylab("Total Counts")
+
+# Bar plot for individual samples
+ggplot(sample_stats, aes(x = Sample, y = Total_Counts, fill = Group)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Sequencing Depth per Sample") +
+  ylab("Total Counts")
+
+# Additional plot: Box plot by cell type
+ggplot(sample_stats, aes(x = Cell_Type, y = Total_Counts, fill = Cell_Type)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Sequencing Depth by Cell Type") +
+  ylab("Total Counts")
+
+######################################
+
+#### violin plot
+ggplot(sample_stats, aes(x = Cell_Type, y = Total_Counts, fill = Cell_Type)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.1, fill = "white", alpha = 0.5) +
+  scale_y_log10() + 
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Sequencing Depth by Cell Type",
+    y = "Total Counts (log10 scale)",
+    x = "Cell Type"
+  )
+
+sample_level_stats <- sample_stats %>%
+  group_by(Sample, Group) %>%
+  summarise(
+    Median_Counts = median(Total_Counts),
+    Mean_Counts = mean(Total_Counts),
+    Cell_Count = n(),
+    .groups = 'drop'
+  )
+
+# violin plot for samples
+ggplot(sample_stats %>% filter(Total_Counts > 0), 
+       aes(x = Sample, y = Total_Counts, fill = Group)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.1, fill = "white", alpha = 0.5) +
+  scale_y_log10(labels = scales::comma) +  # Log scale for better visualization
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.y = element_line(color = "grey90"),
+    legend.position = "top"
+  ) +
+  labs(
+    title = "Sequencing Depth Distribution per Sample",
+    y = "Total Counts (log10 scale)",
+    x = "Sample ID"
+  )
+```
+
+
+```{r}
+# Setting threshold for minimum reads
+X <- 5
+
+# Getting the count matrix
+counts_matrix <- GetAssayData(AD_seurat_obj, slot = "counts")
+
+# Creating a data frame with cell-level information
+cell_data <- data.frame(
+  Sample = AD_seurat_obj$sample_id,
+  CellType = AD_seurat_obj$cluster_celltype,
+  Status = AD_seurat_obj$Status,
+  Genes_Detected = colSums(counts_matrix >= X)  # Number of genes detected per cell at threshold X
+)
+
+# Creating violin plot
+ggplot(cell_data, aes(x = Sample, y = Genes_Detected, fill = Status)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.1, fill = "white", alpha = 0.5) +
+  scale_y_log10(labels = scales::comma) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.y = element_line(color = "grey90"),
+    legend.position = "top"
+  ) +
+  labs(
+    title = sprintf("Number of Genes Detected per Cell (≥%d reads)", X),
+    subtitle = "Distribution across samples",
+    y = "Number of Genes Detected",
+    x = "Sample ID"
+  )
+
+# Adding faceting by cell type
+ggplot(cell_data, aes(x = Sample, y = Genes_Detected, fill = Status)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.1, fill = "white", alpha = 0.5) +
+  scale_y_log10(labels = scales::comma) +
+  facet_wrap(~CellType) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.y = element_line(color = "grey90"),
+    legend.position = "top"
+  ) +
+  labs(
+    title = sprintf("Number of Genes Detected per Cell (≥%d reads)", X),
+    subtitle = "Distribution across samples and cell types",
+    y = "Number of Genes Detected",
+    x = "Sample ID"
+  )
+
+ggsave("Number_of_Genes_Detected_per_Cell_violin_plot.png", width = 10, height = 8)
+
+```
+
+```{r}
+# Getting the counts matrix
+counts_matrix <- GetAssayData(AD_seurat_obj, slot = "counts")
+
+# Creating a data frame with reads per gene per cell for each sample
+reads_per_gene_cell <- data.frame(
+  Sample = AD_seurat_obj$sample_id,
+  Status = AD_seurat_obj$Status,
+  Cell_Type = AD_seurat_obj$cluster_celltype
+)
+
+# Adding number of reads per gene (>0) for each cell
+reads_per_gene_cell$Genes_with_Reads <- colSums(counts_matrix > 0)
+reads_per_gene_cell$Mean_Reads_per_Gene <- colSums(counts_matrix) / reads_per_gene_cell$Genes_with_Reads
+
+# Creating violin plot
+ggplot(reads_per_gene_cell, aes(x = Sample, y = Mean_Reads_per_Gene, fill = Status)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.1, fill = "white", alpha = 0.5) +
+  scale_y_log10(labels = scales::comma) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.y = element_line(color = "grey90"),
+    legend.position = "top"
+  ) +
+  labs(
+    title = "Mean Reads per Gene Distribution by Sample",
+    y = "Mean Reads per Gene (log10 scale)",
+    x = "Sample ID"
+  )
+
+# faceting by cell type
+ggplot(reads_per_gene_cell, aes(x = Sample, y = Mean_Reads_per_Gene, fill = Status)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.1, fill = "white", alpha = 0.5) +
+  scale_y_log10(labels = scales::comma) +
+  facet_wrap(~Cell_Type) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.y = element_line(color = "grey90"),
+    legend.position = "top"
+  ) +
+  labs(
+    title = "Mean Reads per Gene Distribution by Sample and Cell Type",
+    y = "Mean Reads per Gene (log10 scale)",
+    x = "Sample ID"
+  )
+
+  ggsave("Mean_Reads_per_Gene_Distribution_by_Sample_and_Cell_Type_violin_plot.png", width = 10, height = 8)
