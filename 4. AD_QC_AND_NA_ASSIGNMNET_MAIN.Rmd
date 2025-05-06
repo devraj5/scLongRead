@@ -1,0 +1,900 @@
+---
+title: "AD_QC_AND_NA_ASSIGNMNET_MAIN.Rmd"
+author: "Dev Raj Bhattarai"
+date: "2025-02-06"
+output: html_document
+---
+
+
+```{r}
+setwd("/data/project/rizzardilab/drbhatta/long_read/AD_EDA")
+```
+
+```{r}
+library(Seurat)
+library(DoubletFinder)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(biomaRt)
+library(harmony)
+library(glmGamPoi)
+library(rtracklayer)
+library(Gviz)
+library(GenomicAlignments)
+```
+
+```{r}
+AD_seurat_obj <- readRDS("AD_main_merged_seurat_obj_gene_level_transcript_level.rds")
+DefaultAssay(AD_seurat_obj) <- "RNA"
+```
+
+```{r}
+AD_seurat_obj$cluster_celltype[is.na(AD_seurat_obj$cluster_celltype)] <- "Unassigned"
+cells_to_keep <- AD_seurat_obj$cluster_celltype != "Endothelial" & 
+                 AD_seurat_obj$cluster_celltype != "Pericytes"
+AD_seurat_obj <- AD_seurat_obj[, cells_to_keep]
+```
+
+```{r}
+# Setting up biomaRt
+ensembl <- useEnsembl(biomart = "ensembl", 
+                      dataset = "hsapiens_gene_ensembl")
+
+# Getting current gene IDs (removing version numbers)
+ens_genes <- gsub("\\.[0-9]*$", "", rownames(AD_seurat_obj))
+
+# Converting ENSEMBL IDs to gene symbols
+gene_map <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                 filters = "ensembl_gene_id",
+                 values = ens_genes,
+                 mart = ensembl)
+
+# Creating a named vector for conversion
+gene_name_map <- setNames(gene_map$external_gene_name, gene_map$ensembl_gene_id)
+
+# First, creating a version-free gene ID map for matching
+gene_ids_no_version <- gsub("\\.[0-9]*$", "", rownames(AD_seurat_obj))
+names(gene_ids_no_version) <- rownames(AD_seurat_obj)
+
+# Getting mitochondrial genes
+mt_genes <- gene_map$ensembl_gene_id[grep("^MT-", gene_map$external_gene_name)]
+mt_genes_full <- names(gene_ids_no_version)[gene_ids_no_version %in% mt_genes]
+print("Number of matching mitochondrial genes with versions:")
+print(length(mt_genes_full))
+
+# Calculating mitochondrial percentage
+AD_seurat_obj[["percent.mt"]] <- PercentageFeatureSet(
+    AD_seurat_obj, 
+    features = mt_genes_full
+)
+
+# Geting ribosomal genes with versions
+rp_genes <- gene_map$ensembl_gene_id[grep("^RP[SL]", gene_map$external_gene_name)]
+rp_genes_full <- names(gene_ids_no_version)[gene_ids_no_version %in% rp_genes]
+print("Number of matching ribosomal genes with versions:")
+print(length(rp_genes_full))
+
+# Calculating ribosomal percentage
+AD_seurat_obj[["percent.rb"]] <- PercentageFeatureSet(
+    AD_seurat_obj, 
+    features = rp_genes_full
+)
+```
+
+```{r}
+# Visualizing before filtering
+VlnPlot(AD_seurat_obj, 
+              features = "nFeature_RNA", 
+              pt.size = 0, 
+              group.by = "long_read_sample_id") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ggtitle("nFeature_RNA")
+
+VlnPlot(AD_seurat_obj, 
+              features = "nCount_RNA", 
+              pt.size = 0, 
+              group.by = "long_read_sample_id") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ggtitle("nCount_RNA")
+
+VlnPlot(AD_seurat_obj, 
+              features = "percent.mt", 
+              pt.size = 0, 
+              group.by = "long_read_sample_id") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ggtitle("percent.mt")
+
+VlnPlot(AD_seurat_obj, 
+              features = "percent.rb", 
+              pt.size = 0, 
+              group.by = "long_read_sample_id") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ggtitle("percent.rb")
+```
+
+```{r}
+FeatureScatter(AD_seurat_obj, 
+               feature1 = "nCount_RNA", 
+               feature2 = "nFeature_RNA",
+               group.by = "long_read_sample_id")
+```
+
+```{r}
+sample_to_plot <- "HCT17HEX"
+
+# Getting the cells for the specified sample
+cells_sample <- WhichCells(AD_seurat_obj, expression = long_read_sample_id == sample_to_plot)
+
+# Creating the scatter plot for the specified sample
+FeatureScatter(AD_seurat_obj, 
+                                feature1 = "nCount_RNA", 
+                                feature2 = "nFeature_RNA", 
+                                cells = cells_sample)
+```
+
+
+```{r}
+# Calculating maximum percent.mt for each sample with NA handling
+max_mt <- AD_seurat_obj@meta.data %>%
+    group_by(long_read_sample_id) %>%
+    summarise(max_mt = max(percent.mt, na.rm = TRUE)) %>%
+    arrange(desc(max_mt))
+
+# Alternative calculation to double-check
+sample_stats <- AD_seurat_obj@meta.data %>%
+    group_by(long_read_sample_id) %>%
+    summarise(
+        max_mt = max(percent.mt, na.rm = TRUE),
+        median_mt = median(percent.mt, na.rm = TRUE),
+        mean_mt = mean(percent.mt, na.rm = TRUE),
+        n_cells = n(),
+        n_na = sum(is.na(percent.mt))
+    )
+
+print(sample_stats)
+```
+
+```{r}
+# Getting summary statistics for each metric by sample
+summary_stats <- AD_seurat_obj@meta.data %>%
+    group_by(long_read_sample_id) %>%
+    summarise(
+        n_cells = n(),
+        median_features = median(nFeature_RNA),
+        mean_features = mean(nFeature_RNA),
+        q10_features = quantile(nFeature_RNA, 0.1),
+        q90_features = quantile(nFeature_RNA, 0.9),
+        median_counts = median(nCount_RNA),
+        mean_counts = mean(nCount_RNA),
+        median_mt = median(percent.mt, na.rm = TRUE),
+        mean_mt = mean(percent.mt, na.rm = TRUE),
+        median_rb = median(percent.rb, na.rm = TRUE),
+        mean_rb = mean(percent.rb, na.rm = TRUE)
+    )
+
+print(summary_stats)
+write.csv(summary_stats, "summary_stats_by_sample.csv")
+```
+
+```{r}
+quantile_thresholds <- list(
+    feature = quantile(AD_seurat_obj$nFeature_RNA, probs = c(0.01, 0.99), na.rm = TRUE),
+    mt = quantile(AD_seurat_obj$percent.mt, probs = c(0.01, 0.99), na.rm = TRUE)
+)
+
+print("\nQuantile-based thresholds (1st and 99th percentiles):")
+print(quantile_thresholds)
+
+# Calculating summary statistics for each metric
+summary_stats <- data.frame(
+    Metric = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rb"),
+    Median = c(
+        median(AD_seurat_obj$nFeature_RNA, na.rm = TRUE),
+        median(AD_seurat_obj$percent.mt, na.rm = TRUE)
+    ),
+    Mean = c(
+        mean(AD_seurat_obj$nFeature_RNA, na.rm = TRUE),
+        mean(AD_seurat_obj$percent.mt, na.rm = TRUE)
+    ),
+    SD = c(
+        sd(AD_seurat_obj$nFeature_RNA, na.rm = TRUE),
+        sd(AD_seurat_obj$percent.mt, na.rm = TRUE)
+    )
+)
+
+print("\nSummary statistics:")
+print(summary_stats)
+
+
+ggplot(AD_seurat_obj@meta.data, aes(x=nFeature_RNA)) +
+    geom_histogram(bins=40) +
+    geom_vline(xintercept=quantile_thresholds$feature, color="blue", linetype="dotted") +
+    theme_minimal() +
+    ggtitle("nFeature RNA distribution")
+
+ggplot(AD_seurat_obj@meta.data, aes(x=percent.mt)) +
+    geom_histogram(bins=40) +
+    geom_vline(xintercept=quantile_thresholds$mt, color="blue", linetype="dotted") +
+    theme_minimal() +
+    ggtitle("Percent MT distribution")
+```
+
+# 3. Cell Filtering
+```{r}
+AD_seurat_obj_filtered <- subset(AD_seurat_obj,
+    subset = nFeature_RNA > 300 &     
+             nFeature_RNA < 8000 &
+             percent.mt < 15
+)
+```
+
+```{r}
+print(paste0("Number of cells: ", ncol(AD_seurat_obj_filtered)))
+```
+
+
+# Doublet Detection using DoubletFinder
+```{r}
+ # Runing SCTransform 
+options(future.globals.maxSize = 8 * 1024^3)
+AD_seurat_obj_filtered <- SCTransform(AD_seurat_obj_filtered, 
+                                          vars.to.regress = "percent.mt", 
+                                          method = "glmGamPoi")
+
+AD_seurat_obj_filtered <- RunPCA(AD_seurat_obj_filtered, npcs = 30)
+
+# Parameter optimization
+sweep.res <- DoubletFinder:::paramSweep(AD_seurat_obj_filtered, PCs = 1:15, sct = TRUE)
+sweep.stats <- DoubletFinder:::summarizeSweep(sweep.res, GT = FALSE)
+bcmvn <- DoubletFinder:::find.pK(sweep.stats)
+optimal_pK <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+
+head(bcmvn)
+
+ggplot(bcmvn, aes(x = pK, y = BCmetric)) +
+  geom_line() +
+  geom_point() +
+  ggtitle("BCMVN vs pK")
+
+ggsave("bcmvn_plot.png")
+
+ggplot(AD_seurat_obj_filtered@meta.data, aes(x = `pANN_0.25_0.09_4725`)) +
+  geom_histogram(bins = 50) +
+  geom_vline(xintercept = quantile(AD_seurat_obj_filtered@meta.data$`pANN_0.25_0.09_4725`, 0.95), color = "red") +
+  ggtitle("Distribution of pANN Scores")
+
+ggsave("pANN_plot.png")
+
+# Runing DoubletFinder with 5.6% expected doublets
+nExp_poi <- round(0.056 * ncol(AD_seurat_obj_filtered))
+AD_seurat_obj_filtered <- doubletFinder(
+  AD_seurat_obj_filtered,
+  PCs = 1:15,
+  pN = 0.25,
+  pK = optimal_pK,
+  nExp = nExp_poi,
+  sct = TRUE
+)
+
+# Filtering doublets
+df_col <- grep("DF.classifications", colnames(AD_seurat_obj_filtered@meta.data), value = TRUE)
+
+AD_seurat_obj_filtered <- RunUMAP(AD_seurat_obj_filtered, dims = 1:15)
+
+DimPlot(AD_seurat_obj_filtered, reduction = "umap", group.by = df_col, pt.size = 1) +
+  ggtitle("UMAP of Cells: Doublets vs Singlets")
+
+ggsave("doublet_vs_singlet.png")
+
+AD_seurat_obj_filtered <- subset(AD_seurat_obj_filtered, cells = colnames(AD_seurat_obj_filtered)[AD_seurat_obj_filtered[[df_col]] == "Singlet"])
+
+print(paste0("Number of cells: ", ncol(AD_seurat_obj_filtered)))
+```
+
+# Gene/Isoform Filtering
+```{r}
+AD_seurat_obj_filtered <- readRDS("AD_seurat_filtered_final_2_13.rds")
+DefaultAssay(AD_seurat_obj_filtered) <- "RNA"
+
+# Gene filtering (UMI >10) - store filter criteria
+counts_matrix <- LayerData(AD_seurat_obj, assay = "RNA", layer = "counts")
+genes_keep <- rowSums(counts_matrix > 0) >= 5
+genes_umi <- rowSums(counts_matrix) > 10
+
+# Isoform filtering
+transcript_matrix <- LayerData(AD_seurat_obj, assay = "TRANSCRIPT", layer = "counts")
+
+# Handling transcript-gene mapping with version stripping
+clean_transcript_ids <- sub("\\.\\d+$", "", rownames(transcript_matrix))
+ensembl <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+mapping <- getBM(
+  attributes = c("ensembl_transcript_id", "ensembl_gene_id"),
+  filters = "ensembl_transcript_id",
+  values = clean_transcript_ids,
+  mart = ensembl
+)
+
+# Creating mapping vector with NA handling
+transcript_to_gene <- setNames(mapping$ensembl_gene_id, mapping$ensembl_transcript_id)[clean_transcript_ids]
+
+# Calculate isoform percentages with NA protection
+valid_isoforms <- !is.na(transcript_to_gene)
+gene_totals <- tapply(
+  rowSums(transcript_matrix[valid_isoforms,]), 
+  transcript_to_gene[valid_isoforms], 
+  sum
+)
+
+isoform_percentages <- rep(NA, nrow(transcript_matrix))
+isoform_percentages[valid_isoforms] <- rowSums(transcript_matrix[valid_isoforms,]) / 
+  gene_totals[transcript_to_gene[valid_isoforms]]
+
+# Defining isoform filters
+isoforms_keep <- rowSums(transcript_matrix > 0) >= 5
+isoforms_umi <- rowSums(transcript_matrix) > 5  
+isoforms_percent <- isoform_percentages > 0.02 & !is.na(isoform_percentages)
+
+# Combining filters
+isoforms_keep_final <- isoforms_keep & isoforms_umi & isoforms_percent
+
+# Printing statistics
+cat("\nIsoform filtering statistics:
+  Original isoforms:", nrow(transcript_matrix), "
+  ≥5 cells:", sum(isoforms_keep), "
+  >5 UMI:", sum(isoforms_umi), "
+  >2% gene:", sum(isoforms_percent, na.rm = TRUE), "
+  Final:", sum(isoforms_keep_final), "\n")
+
+# Creating filtered assays
+filtered_rna <- CreateAssay5Object(
+  counts = counts_matrix[genes_keep & genes_umi, ],
+  data = LayerData(AD_seurat_obj, assay = "RNA", layer = "counts")[genes_keep & genes_umi, ]
+)
+
+filtered_transcript <- CreateAssay5Object(
+  counts = transcript_matrix[isoforms_keep_final, ],
+  data = LayerData(AD_seurat_obj, assay = "TRANSCRIPT", layer = "counts")[isoforms_keep_final, ]
+)
+
+# Building final object
+AD_seurat_obj_filtered <- CreateSeuratObject(
+  counts = filtered_rna,
+  assays = list(TRANSCRIPT = filtered_transcript),
+  meta.data = AD_seurat_obj[[]]  # Preserving metadata
+)
+
+AD_seurat_obj_filtered[["TRANSCRIPT"]] <- filtered_transcript
+
+cat("Final object:
+  Cells:", ncol(AD_seurat_obj_filtered), "
+  Genes:", nrow(filtered_rna), "
+  Isoforms:", nrow(filtered_transcript), "\n")
+
+saveRDS(AD_seurat_obj_filtered, "AD_seurat_filtered_final_2_13_with_gene_transcript_filtration.rds")
+```
+
+# Cell-type Assignment
+```{r}
+AD_seurat_obj_filtered <- readRDS("AD_seurat_filtered_final_2_13_with_gene_transcript_filtration.rds")
+
+DefaultAssay(AD_seurat_obj_filtered) <- "RNA"
+
+options(future.globals.maxSize = 8 * 1024^3)
+
+set.seed(1234)
+
+AD_seurat_obj_filtered <- SCTransform(AD_seurat_obj_filtered, 
+                                          vars.to.regress = "percent.mt", 
+                                          method = "glmGamPoi")
+
+AD_seurat_obj_filtered <- RunPCA(AD_seurat_obj_filtered, assay = "SCT")
+
+AD_seurat_obj_filtered <- RunUMAP(AD_seurat_obj_filtered, reduction = "pca", dims = 1:15)
+AD_seurat_obj_filtered <- FindNeighbors(AD_seurat_obj_filtered, reduction = "pca", dims = 1:15)
+AD_seurat_obj_filtered <- FindClusters(AD_seurat_obj_filtered, resolution = 0.8)
+
+# Cluster-Celltype Mapping
+cluster_assignments <- AD_seurat_obj_filtered@meta.data %>%
+    group_by(seurat_clusters) %>%
+    count(cluster_celltype) %>%
+    mutate(proportion = n/sum(n)) %>%
+    filter(cluster_celltype != "Unassigned") %>%
+    slice_max(proportion, n = 1) %>%
+    filter(proportion > 0.5) %>%  # Require >50% consensus
+    dplyr::select(seurat_clusters, assigned_type = cluster_celltype)
+
+# Assigning NA Cells Based on Cluster Majority
+AD_seurat_obj_filtered$final_celltype <- ifelse(
+    AD_seurat_obj_filtered$cluster_celltype == "Unassigned",
+    cluster_assignments$assigned_type[match(
+        AD_seurat_obj_filtered$seurat_clusters,
+        cluster_assignments$seurat_clusters
+    )],
+    AD_seurat_obj_filtered$cluster_celltype
+)
+
+# Visualization
+DimPlot(AD_seurat_obj_filtered, group.by = "seurat_clusters", label = TRUE)
+ggsave("actual_number_cluster.png")
+DimPlot(AD_seurat_obj_filtered, group.by = "final_celltype", label = TRUE)
+ggsave("cell_type_annotation.png")
+
+
+# Before processing
+initial_na_count <- sum(AD_seurat_obj_filtered$cluster_celltype == "Unassigned")
+
+# After processing
+final_na_count <- sum(is.na(AD_seurat_obj_filtered$final_celltype) | 
+                     AD_seurat_obj_filtered$final_celltype == "Unassigned")
+
+unresolved_clusters <- AD_seurat_obj_filtered@meta.data %>%
+    filter(final_celltype == "Unassigned" | is.na(final_celltype)) %>%
+    count(seurat_clusters)
+
+print(unresolved_clusters)
+
+## looking at cluster 14
+cluster_14_data <- AD_seurat_obj_filtered@meta.data %>%
+    filter(seurat_clusters == 14)
+
+# Calculating annotation statistics
+cluster_14_stats <- cluster_14_data %>%
+    summarize(
+        Total_Cells = n(),
+        Annotated = sum(final_celltype != "Unassigned" & !is.na(final_celltype)),
+        Unannotated = sum(final_celltype == "Unassigned" | is.na(final_celltype)),
+        Annotation_Rate = round(Annotated/Total_Cells * 100, 1)
+    )
+
+print(cluster_14_stats)
+```
+
+```{r}
+saveRDS(AD_seurat_obj_filtered, "AD_seurat_filtered_final__NA_assignment_2_17.rds")
+
+# Visualizing markers 
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+
+marker_genes <- c(
+    # Astrocytes
+    "GFAP", "AQP4", "ALDH1L1",
+    # Oligodendrocytes
+    "MBP", "MOG", "MOBP",
+    # Microglia
+    "CX3CR1", "P2RY12", "TMEM119",
+    # Excitatory neurons
+    "SLC17A7", "CAMK2A",
+    # Inhibitory neurons
+    "GAD1", "GAD2",
+    # OPCs
+    "PDGFRA", "CSPG4"
+)
+
+# Converting gene symbols to ENSEMBL IDs
+gene_ids <- getBM(
+    attributes = c("ensembl_gene_id", "external_gene_name"),
+    filters = "external_gene_name",
+    values = marker_genes,
+    mart = ensembl
+)
+
+# Creating violin plots for marker genes
+DefaultAssay(AD_seurat_obj_filtered) <- "RNA"
+
+seurat_genes <- rownames(AD_seurat_obj_filtered)
+
+# Function to match versioned ENSEMBL IDs
+match_ensembl_ids <- function(ensembl_ids, seurat_genes) {
+    matched_ids <- sapply(ensembl_ids, function(id) {
+        # Find matching gene with version number
+        grep(paste0("^", id, "\\."), seurat_genes, value = TRUE)[1]
+    })
+    return(matched_ids)
+}
+
+# Matching the ENSEMBL IDs with versions in your Seurat object
+matched_ids <- match_ensembl_ids(gene_ids$ensembl_gene_id, seurat_genes)
+matched_ids <- matched_ids[!is.na(matched_ids)] 
+
+# Plotting marker gene expression
+VlnPlot(AD_seurat_obj_filtered, 
+        features = matched_ids, 
+        group.by = "final_celltype", 
+        ncol = 4,
+        pt.size = 0) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("marker_genes_by_celltype.png", width = 15, height = 12)
+
+# Creating quality metrics plots for NA vs identified cells
+quality_metrics <- VlnPlot(AD_seurat_obj_filtered,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        group.by = "final_celltype",
+        ncol = 3,
+        pt.size = 0) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("quality_metrics_by_celltype.png", width = 12, height = 6)
+
+# Creating a feature plot for top marker genes
+FeaturePlot(AD_seurat_obj_filtered,
+            features = matched_ids[1:9], 
+            ncol = 3)
+ggsave("marker_genes_featureplot.png", width = 15, height = 15)
+
+# Calculating and printing statistics for NA cells
+na_stats <- AD_seurat_obj_filtered@meta.data %>%
+    group_by(final_celltype) %>%
+    summarise(
+        cell_count = n(),
+        mean_features = mean(nFeature_RNA),
+        mean_counts = mean(nCount_RNA),
+        mean_mt_percent = mean(percent.mt)
+    )
+
+print(na_stats)
+
+```
+
+```{r}
+# Creating a mapping dataframe
+gene_mapping <- data.frame(
+    ensembl_id = matched_ids,
+    gene_name = gene_ids$external_gene_name[match(gsub("\\..*$", "", matched_ids), 
+                                                 gene_ids$ensembl_gene_id)]
+)
+
+# Grouping by cell type
+gene_mapping <- gene_mapping %>%
+    mutate(cell_type = case_when(
+        gene_name %in% c("GFAP", "AQP4", "ALDH1L1") ~ "Astrocytes",
+        gene_name %in% c("MBP", "MOG", "MOBP") ~ "Oligodendrocytes",
+        gene_name %in% c("CX3CR1", "P2RY12", "TMEM119") ~ "Microglia",
+        gene_name %in% c("SLC17A7", "CAMK2A") ~ "Excitatory neurons",
+        gene_name %in% c("GAD1", "GAD2") ~ "Inhibitory neurons",
+        gene_name %in% c("PDGFRA", "CSPG4") ~ "OPCs"
+    ))
+
+# Printing the organized mapping
+print("ENSEMBL ID to Gene Name Mapping by Cell Type:")
+print(gene_mapping %>% arrange(cell_type))
+```
+
+
+```{r}
+# First identifying which clusters contain NA cells
+NA_clusters <- AD_seurat_obj_filtered@meta.data %>%
+    filter(is.na(final_celltype) | final_celltype == "Unassigned") %>%
+    group_by(seurat_clusters) %>%
+    summarise(
+        NA_count = n(),
+        total_count = nrow(AD_seurat_obj_filtered@meta.data[AD_seurat_obj_filtered@meta.data$seurat_clusters == first(seurat_clusters),]),
+        NA_percentage = round(NA_count/total_count * 100, 2)
+    ) %>%
+    arrange(desc(NA_percentage))
+
+print("Clusters with NA cells:")
+print(NA_clusters)
+
+# Converting marker genes to ENSEMBL IDs with version handling
+marker_genes <- c(
+    # Astrocytes
+    "GFAP", "AQP4", "ALDH1L1",
+    # Oligodendrocytes
+    "MBP", "MOG", "MOBP",
+    # Microglia
+    "CX3CR1", "P2RY12", "TMEM119",
+    # Excitatory neurons
+    "SLC17A7", "CAMK2A",
+    # Inhibitory neurons
+    "GAD1", "GAD2",
+    # OPCs
+    "PDGFRA", "CSPG4"
+)
+
+# Getting ENSEMBL IDs
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+gene_ids <- getBM(
+    attributes = c("ensembl_gene_id", "external_gene_name"),
+    filters = "external_gene_name",
+    values = marker_genes,
+    mart = ensembl
+)
+
+# Getting all genes in your Seurat object
+seurat_genes <- rownames(AD_seurat_obj_filtered)
+
+# Function to match versioned ENSEMBL IDs
+match_ensembl_ids <- function(ensembl_ids, seurat_genes) {
+    matched_ids <- sapply(ensembl_ids, function(id) {
+        # Find matching gene with version number
+        grep(paste0("^", id, "\\."), seurat_genes, value = TRUE)[1]
+    })
+    return(matched_ids)
+}
+
+# Matching the ENSEMBL IDs with versions in your Seurat object
+matched_ids <- match_ensembl_ids(gene_ids$ensembl_gene_id, seurat_genes)
+matched_ids <- matched_ids[!is.na(matched_ids)]  # Remove any unmatched IDs
+
+# Creating plots for NA-containing clusters
+NA_cluster_numbers <- NA_clusters$seurat_clusters
+cells_in_NA_clusters <- WhichCells(AD_seurat_obj_filtered, 
+                                  expression = seurat_clusters %in% NA_cluster_numbers)
+
+# Subsetting for NA clusters
+NA_seurat_subset <- subset(AD_seurat_obj_filtered, cells = cells_in_NA_clusters)
+DefaultAssay(NA_seurat_subset) <- "RNA"
+
+# Printing the genes we're looking at
+print("Marker genes found in dataset:")
+print(matched_ids)
+
+# Violin plots for marker genes
+VlnPlot(NA_seurat_subset, 
+        features = matched_ids,
+        group.by = "seurat_clusters",
+        ncol = 3,
+        pt.size = 0) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("NA_clusters_marker_expression.png", width = 20, height = 15)
+
+# Quality metrics
+VlnPlot(NA_seurat_subset,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        group.by = "seurat_clusters",
+        ncol = 3,
+        pt.size = 0) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("NA_clusters_quality_metrics.png", width = 15, height = 6)
+
+# Feature plots
+FeaturePlot(AD_seurat_obj_filtered,
+            features = matched_ids[1:min(9, length(matched_ids))],
+            cells = cells_in_NA_clusters,
+            ncol = 3)
+ggsave("NA_clusters_feature_plots.png", width = 15, height = 15)
+
+```
+
+
+```{r}
+AD_seurat_obj_filtered <- readRDS("AD_seurat_filtered_final__NA_assignment_2_17.rds")
+
+# Identifying NA-containing clusters
+NA_clusters <- AD_seurat_obj_filtered@meta.data %>%
+    filter(is.na(final_celltype) | final_celltype == "Unassigned") %>%
+    group_by(seurat_clusters) %>%
+    summarise(
+        NA_count = n(),
+        total_count = nrow(AD_seurat_obj_filtered@meta.data[AD_seurat_obj_filtered@meta.data$seurat_clusters == first(seurat_clusters),]),
+        NA_percentage = round(NA_count/total_count * 100, 2)
+    ) %>%
+    arrange(desc(NA_percentage))
+
+# Subseting NA clusters
+cells_in_NA_clusters <- WhichCells(AD_seurat_obj_filtered, 
+                                  expression = seurat_clusters %in% NA_clusters$seurat_clusters)
+NA_seurat_subset <- subset(AD_seurat_obj_filtered, cells = cells_in_NA_clusters)
+DefaultAssay(NA_seurat_subset) <- "RNA"
+
+# UMAP showing mitochondrial percentage in NA clusters
+FeaturePlot(NA_seurat_subset, 
+            features = "percent.mt",
+            cols = c("lightgrey", "blue")) +
+    ggtitle("Mitochondrial % in NA-containing Clusters")
+ggsave("NA_clusters_umap_percent_mt.png", width = 8, height = 6)
+
+### in as a whole UMAP context 
+FeaturePlot(AD_seurat_obj_filtered, 
+            features = "percent.mt",
+            cols = c("lightgrey", "blue")) +
+    ggtitle("Mitochondrial % (All Clusters)") +
+    theme(plot.title = element_text(hjust = 0.5))
+ggsave("all_clusters_umap_percent_mt.png", width = 8, height = 6)
+```
+
+
+```{r}
+DimPlot(NA_seurat_subset,
+                      group.by = "long_read_sample_id",
+                      reduction = "umap",
+                      pt.size = 0.5) +
+    ggtitle("Sample Distribution in NA Clusters") +
+    theme(legend.position = "right")
+
+ggsave("sample_ids in NA_clusters.png", width = 8, height = 6)
+
+cells_4313 <- WhichCells(NA_seurat_subset, 
+                        expression = long_read_sample_id == "4313")
+cells_HCTZZT <- WhichCells(NA_seurat_subset, 
+                          expression = long_read_sample_id == "HCTZZT")
+
+DimPlot(NA_seurat_subset, 
+        cells.highlight = list(Sample_4313 = cells_4313, 
+                              Sample_HCTZZT = cells_HCTZZT),
+        cols.highlight = c("red", "blue"),
+        sizes.highlight = 1,
+        pt.size = 0.5) +
+    ggtitle("Samples 4313 and HCTZZT in NA Clusters") +
+    theme(plot.title = element_text(hjust = 0.5))
+ggsave("NA_clusters_4313_HCTZZT.png", width = 10, height = 8)
+```
+
+
+```{r}
+# Loading the Seurat object
+AD_seurat_obj_filtered <- readRDS("AD_seurat_filtered_final__NA_assignment_2_17.rds")
+
+# Identifying cells with mitochondrial percentage ≤ 5%
+low_mt_cells <- WhichCells(AD_seurat_obj_filtered, 
+                          expression = percent.mt <= 5)
+
+# Counting how many cells have low mitochondrial percentage
+low_mt_count <- length(low_mt_cells)
+total_cells <- ncol(AD_seurat_obj_filtered)
+low_mt_percent <- round(low_mt_count/total_cells * 100, 2)
+
+print(paste0("Cells with ≤5% mitochondrial content: ", 
+            low_mt_count, " out of ", total_cells, 
+            " (", low_mt_percent, "%)"))
+
+# Method 1: Highlighting low-mt cells in the UMAP
+DimPlot(AD_seurat_obj_filtered, 
+        cells.highlight = list(LowMT = low_mt_cells),
+        cols.highlight = "blue",
+        sizes.highlight = 0.5,
+        pt.size = 0.1) +
+    ggtitle(paste0("Cells with ≤5% Mitochondrial Content (", 
+                  low_mt_percent, "% of all cells)")) +
+    theme(plot.title = element_text(hjust = 0.5))
+ggsave("low_mt_cells_highlight.png", width = 10, height = 8)
+
+
+
+
+# Method 2: Continuous visualization with custom color scale
+FeaturePlot(AD_seurat_obj_filtered, 
+            features = "percent.mt",
+            min.cutoff = 0, 
+            max.cutoff = 5,
+            cols = c("blue", "lightgrey")) +
+    ggtitle(paste0("Cells with ≤5% Mitochondrial Content (", 
+                  low_mt_percent, "% of all cells)")) +
+    theme(plot.title = element_text(hjust = 0.5))
+ggsave("low_mt_cells_continuous.png", width = 10, height = 8)
+```
+
+```{r}
+# Identifying cells with mitochondrial percentage ≤ 5%
+low_mt_cells <- WhichCells(AD_seurat_obj_filtered, 
+                          expression = percent.mt <= 5)
+
+# Creating a data frame with sample information
+sample_stats <- data.frame(
+  Sample_ID = AD_seurat_obj_filtered$long_read_sample_id,
+  Cell_Barcode = colnames(AD_seurat_obj_filtered),
+  Is_Low_MT = colnames(AD_seurat_obj_filtered) %in% low_mt_cells,
+  MT_Percent = AD_seurat_obj_filtered$percent.mt,
+  Cluster = AD_seurat_obj_filtered$seurat_clusters,
+  Status = AD_seurat_obj_filtered$Status
+)
+
+# Calculating sample-level statistics
+sample_summary <- sample_stats %>%
+  group_by(Sample_ID) %>%
+  summarise(
+    Total_Cells = n(),
+    Low_MT_Cells = sum(Is_Low_MT),
+    Percent_Low_MT = round(sum(Is_Low_MT)/n() * 100, 2),
+    Mean_MT_Percent = round(mean(MT_Percent), 2)
+  ) %>%
+  arrange(desc(Percent_Low_MT))
+
+# Printing summary
+print(sample_summary)
+
+ggplot(sample_summary, aes(x = reorder(Sample_ID, -Percent_Low_MT), y = Percent_Low_MT)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 8)) +
+  labs(title = "Percentage of Cells with ≤5% MT by Sample",
+       x = "Sample ID", 
+       y = "Percentage")
+ggsave("low_mt_percentage_by_sample.png", width = 15, height = 6)
+```
+
+##############################################
+###using scdblfinder
+###using r_scdb env
+
+```{r}
+library(Seurat)
+library(SingleCellExperiment)
+library(scDblFinder)
+library(BiocParallel)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+
+setwd("/data/project/rizzardilab/drbhatta/long_read/AD_EDA")
+AD_seurat_obj_filtered <- readRDS("AD_seurat_filtered_final__NA_assignment_2_17.rds")
+
+# Extracting the RNA counts
+counts_matrix <- LayerData(AD_seurat_obj_filtered, assay = "RNA", layer = "counts")
+
+# Getting cell metadata
+cell_metadata <- AD_seurat_obj_filtered@meta.data
+
+# Creating a SingleCellExperiment object
+sce <- SingleCellExperiment(assays = list(counts = counts_matrix),
+                           colData = cell_metadata)
+
+sample_column <- "long_read_sample_id"
+
+# running the scDblFinder
+sce <- scDblFinder(sce, 
+                  samples = sample_column,
+                  dbr = NULL,  # Automatically estimate doublet rate based on cell numbers
+                  clusters = TRUE,  # cluster-based artificial doublet generation
+                  BPPARAM = MulticoreParam(workers = 4))
+
+# Extracting doublet scores and classifications
+doublet_scores <- colData(sce)$scDblFinder.score
+doublet_class <- colData(sce)$scDblFinder.class
+
+# Adding to Seurat object
+AD_seurat_obj_filtered$scDblFinder.score <- doublet_scores
+AD_seurat_obj_filtered$scDblFinder.class <- doublet_class
+
+# Visualizing doublet scores on your UMAP
+FeaturePlot(AD_seurat_obj_filtered, features = "scDblFinder.score", 
+           cols = c("lightgrey", "darkred"), 
+           order = TRUE)
+ggsave("scDblFinder_score_UMAP.png", width = 8, height = 6)
+
+# Visualizing doublet classifications
+DimPlot(AD_seurat_obj_filtered, group.by = "scDblFinder.class")
+ggsave("scDblFinder_class_UMAP.png", width = 8, height = 6)
+
+singlet_obj <- subset(AD_seurat_obj_filtered, subset = scDblFinder.class == "singlet")
+DimPlot(singlet_obj, reduction = "umap", group.by = "scDblFinder.class")
+ggsave("scDblFinder_singlet_UMAP.png", width = 8, height = 6)
+
+singlet_obj_mt <- subset(singlet_obj, subset = percent.mt <= 5)
+DimPlot(singlet_obj_mt, reduction = "umap")
+ggsave("scDblFinder_singlet_with_percent.mt_UMAP.png", width = 8, height = 6)
+
+DimPlot(singlet_obj_mt, reduction = "umap", group.by = "final_celltype")
+ggsave("scDblFinder_singlet_with_percent.mt_with_celltype_UMAP.png", width = 8, height = 6)
+
+cells_to_keep <- which(!is.na(singlet_obj_mt$final_celltype))
+singlet_obj_mt_final <- singlet_obj_mt[, cells_to_keep]
+DimPlot(singlet_obj_mt_final, reduction = "umap", group.by = "final_celltype")
+ggsave("scDblFinder_singlet_with_percent.mt_with_celltype__no _NA_UMAP.png", width = 8, height = 6)
+
+saveRDS(AD_seurat_obj_filtered, "AD_seurat_filtered_final_doublet_detection_not_removal_2_25.rds")
+
+# Filtering out doublets
+seurat_obj_filtered <- subset(AD_seurat_obj_filtered, subset = scDblFinder.class == "singlet")
+```
+
+
+```{r}
+####Removing NAs from Status using sample id
+status_mapping <- AD_seurat_obj_filtered@meta.data %>%
+  filter(!is.na(Status)) %>%
+  distinct(long_read_sample_id, Status)
+
+AD_seurat_obj_filtered$Status_fixed <- ifelse(
+  is.na(AD_seurat_obj_filtered$Status),
+  status_mapping$Status[match(AD_seurat_obj_filtered$long_read_sample_id, status_mapping$long_read_sample_id)],
+  AD_seurat_obj_filtered$Status
+)
+
+AD_seurat_obj_filtered$Status <- AD_seurat_obj_filtered$Status_fixed
+AD_seurat_obj_filtered$Status_fixed <- NULL
+
+saveRDS(AD_seurat_obj_filtered, "AD_seurat_filtered_final_NA_assignment_status_fix_2_18.rds")
+```
