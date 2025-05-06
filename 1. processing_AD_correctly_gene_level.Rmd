@@ -1,0 +1,431 @@
+```{r}
+setwd("/data/project/rizzardilab/drbhatta/long_read/AD_EDA")
+```
+
+
+```{r}
+library(Seurat)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(biomaRt)
+```
+
+```{r}
+# Reading input data
+sample_info <- read.csv("AD_sequencing_result_gene_count.csv", stringsAsFactors = FALSE)
+short_read_seurat <- readRDS("Filtered_seurat_object.rds")
+short_read_metadata <- short_read_seurat@meta.data
+```
+
+```{r}
+# Function for reading and processing barcodes
+process_barcodes <- function(barcode_file, sample_id) {
+    # Reading barcodes
+    barcodes <- read.csv(barcode_file, header = TRUE)[,2]
+    barcodes <- sub("-\\d+$", "", barcodes)
+    return(barcodes)
+}
+
+# Function for getting Y chromosome genes using biomaRt
+get_Y_genes <- function(seurat_obj) {
+    # Connecting to Ensembl
+    ensembl <- useEnsembl(biomart = "ensembl", 
+                         dataset = "hsapiens_gene_ensembl")
+    
+    # Getting all gene IDs from data (removing version numbers for query)
+    all_genes <- rownames(seurat_obj)
+    base_genes <- gsub("\\.[0-9]+$", "", all_genes)
+    
+    # Querying biomaRt for Y chromosome genes
+    gene_info <- getBM(
+        attributes = c("ensembl_gene_id", "chromosome_name"),
+        filters = "ensembl_gene_id",
+        values = base_genes,
+        mart = ensembl
+    )
+    
+    # Filtering for Y chromosome genes
+    y_genes_base <- gene_info$ensembl_gene_id[gene_info$chromosome_name == "Y"]
+    
+    # Matching back to versioned gene IDs
+    y_genes <- all_genes[grep(paste(y_genes_base, collapse = "|"), 
+                            base_genes)]
+    
+    return(y_genes)
+}
+
+# Function for assigning cells to samples
+assign_cells_to_samples <- function(seurat_obj, sample_ids, sexes, barcode_files, short_read_metadata) {
+    seurat_obj$sample_id <- NA  # Initializing sample assignment
+    
+    # Cleaning cell names (remove suffix) for matching
+    clean_cell_names <- sub("-\\d+$", "", colnames(seurat_obj))
+    
+    # 1. First trying short-read metadata
+    for(i in seq_along(sample_ids)) {
+        # Getting cells from metadata and cleaning names
+        metadata_cells <- rownames(short_read_metadata)[short_read_metadata$id == sample_ids[i]]
+        metadata_cells <- sub("-\\d+$", "", metadata_cells)
+        
+        # Finding matching cells
+        matching_cells <- which(clean_cell_names %in% metadata_cells)
+        if(length(matching_cells) > 0) {
+            seurat_obj$sample_id[matching_cells] <- sample_ids[i]
+        }
+        
+        cat(sprintf("\nSample %s - Cells assigned by metadata: %d\n", 
+                   sample_ids[i], length(matching_cells)))
+    }
+    
+    # 2. Using barcode files for unassigned cells
+    unassigned_cells <- which(is.na(seurat_obj$sample_id))
+    if(length(unassigned_cells) > 0 && !is.null(barcode_files)) {
+        for(i in seq_along(barcode_files)) {
+            if(file.exists(barcode_files[i])) {
+                # Reading and processing barcodes with correct sample ID
+                barcodes <- process_barcodes(barcode_files[i], sample_ids[i])
+                
+                # Finding matching cells among unassigned
+                matching_cells <- unassigned_cells[clean_cell_names[unassigned_cells] %in% barcodes]
+                if(length(matching_cells) > 0) {
+                    seurat_obj$sample_id[matching_cells] <- sample_ids[i]
+                }
+                
+                cat(sprintf("Sample %s - Additional cells assigned by barcodes: %d\n", 
+                          sample_ids[i], length(matching_cells)))
+            }
+        }
+    }
+    
+    # 3. Using Y chromosome expression for remaining cells
+    unassigned_cells <- colnames(seurat_obj)[is.na(seurat_obj$sample_id)]
+    if(length(unassigned_cells) > 0) {
+        # Getting Y chromosome genes
+        y_genes <- get_Y_genes(seurat_obj)
+        cat(sprintf("\nFound %d Y chromosome genes\n", length(y_genes)))
+        
+        if(length(y_genes) > 0) {
+            # Calculate Y expression
+            y_expr_matrix <- GetAssayData(seurat_obj, slot = "counts")[y_genes, unassigned_cells, drop = FALSE]
+            y_expr <- Matrix::colSums(y_expr_matrix)
+            
+            # Creating diagnostic plot
+            pdf("Y_expression_distribution.pdf")
+            hist(y_expr, breaks = 50, 
+                 main = "Y Chromosome Expression Distribution",
+                 xlab = "Total Y chromosome gene expression")
+            abline(v = median(y_expr) + 2*mad(y_expr), col = "red", lwd = 2)
+            dev.off()
+            
+            # Assigning based on Y expression
+            threshold <- median(y_expr) + 2*mad(y_expr)
+            cell_sex <- ifelse(y_expr > threshold, "M", "F")
+            
+            # Mapping sex to sample IDs
+            male_sample <- sample_ids[sexes == "M"]
+            female_sample <- sample_ids[sexes == "F"]
+            seurat_obj$sample_id[unassigned_cells] <- ifelse(cell_sex == "M", 
+                                                            male_sample, 
+                                                            female_sample)
+            
+            # Printing assignment summary
+            cat("\nY-based assignment summary:\n")
+            cat(sprintf("Male cells (assigned to %s): %d\n", 
+                       male_sample, sum(cell_sex == "M")))
+            cat(sprintf("Female cells (assigned to %s): %d\n", 
+                       female_sample, sum(cell_sex == "F")))
+            
+            # Storing Y expression in metadata
+            seurat_obj$Y_expression <- NA
+            seurat_obj$Y_expression[unassigned_cells] <- y_expr
+        } else {
+            warning("No Y chromosome genes found!")
+        }
+    }
+    
+    # Printing final assignment summary
+    cat("\nFinal assignment summary:\n")
+    for(sample_id in sample_ids) {
+        cat(sprintf("Sample %s: %d cells\n", 
+                   sample_id, sum(seurat_obj$sample_id == sample_id)))
+    }
+    
+    return(seurat_obj)
+}
+
+# Function to process single sample
+process_single_sample <- function(count_file, sample_id, metadata) {
+    cat(sprintf("\nProcessing single sample: %s\n", sample_id))
+    
+    # Reading counts
+    counts <- fread(count_file, sep = "\t", header = TRUE, data.table = FALSE)
+    rownames(counts) <- counts[[1]]
+    counts <- counts[,-1]
+    
+    # Creating Seurat object
+    seurat_obj <- CreateSeuratObject(counts = counts)
+    
+    # Filtering and cleaning metadata just like in AD_EDA.R
+    filtered_metadata <- metadata[metadata$id == sample_id, ]
+    if(nrow(filtered_metadata) > 0) {
+        # Cleaning barcodes and remove duplicates
+        base_barcodes <- gsub("-\\d+$", "", rownames(filtered_metadata))
+        unique_barcodes <- !duplicated(base_barcodes)
+        filtered_metadata <- filtered_metadata[unique_barcodes, ]
+        rownames(filtered_metadata) <- gsub("-\\d+$", "", rownames(filtered_metadata))
+        
+        # Finding common cells
+        common_cells <- intersect(colnames(seurat_obj), rownames(filtered_metadata))
+        cat(sprintf("Number of matching cells with metadata: %d\n", length(common_cells)))
+        
+        # Adding metadata for matching cells
+        if(length(common_cells) > 0) {
+            seurat_obj <- AddMetaData(
+                object = seurat_obj,
+                metadata = filtered_metadata[common_cells, ]
+            )
+        }
+    }
+    
+    seurat_obj$sample_id <- sample_id
+    return(seurat_obj)
+}
+
+# Function to process pooled sample
+process_pooled_sample <- function(count_file, sample_ids, sexes, barcode_files, short_read_metadata) {
+    cat(sprintf("\nProcessing pooled samples: %s\n", paste(sample_ids, collapse=", ")))
+    
+    # Creating Seurat object as before
+    counts <- fread(count_file, sep = "\t", header = TRUE, data.table = FALSE)
+    rownames(counts) <- counts[[1]]
+    counts <- counts[,-1]
+    seurat_obj <- CreateSeuratObject(counts = counts)
+    
+    # Assigning cells to samples
+    seurat_obj <- assign_cells_to_samples(
+        seurat_obj, sample_ids, sexes, barcode_files, short_read_metadata
+    )
+    
+    # Spliting into separate objects and add metadata for each
+    seurat_list <- list()
+    for(sample_id in sample_ids) {
+        cells <- colnames(seurat_obj)[seurat_obj$sample_id == sample_id]
+        if(length(cells) > 0) {
+            temp_obj <- seurat_obj[, cells]
+            
+            # Adding metadata like in single sample processing
+            filtered_metadata <- short_read_metadata[short_read_metadata$id == sample_id, ]
+            if(nrow(filtered_metadata) > 0) {
+                base_barcodes <- gsub("-\\d+$", "", rownames(filtered_metadata))
+                unique_barcodes <- !duplicated(base_barcodes)
+                filtered_metadata <- filtered_metadata[unique_barcodes, ]
+                rownames(filtered_metadata) <- gsub("-\\d+$", "", rownames(filtered_metadata))
+                
+                common_cells <- intersect(colnames(temp_obj), rownames(filtered_metadata))
+                if(length(common_cells) > 0) {
+                    temp_obj <- AddMetaData(
+                        object = temp_obj,
+                        metadata = filtered_metadata[common_cells, ]
+                    )
+                }
+            }
+            seurat_list[[sample_id]] <- temp_obj
+        }
+    }
+    
+    return(seurat_list)
+}
+
+# First, organizing samples by type
+organize_samples <- function(sample_info) {
+    sample_groups <- list(
+        single = list(),
+        pooled_single = list(),
+        pooled_multiple = list()
+    )
+    
+    # Tracking which samples we've processed
+    processed_samples <- c()
+    
+    for(i in 1:nrow(sample_info)) {
+        # Get the actual sample IDs from metadata column
+        sample_ids <- unlist(strsplit(sample_info$id_column_in_short_read_metadata[i], "\\|"))
+        
+        # Skiping if we've already processed these samples
+        if(any(sample_ids %in% processed_samples)) next
+        
+        if(length(sample_ids) == 1) {
+            # Single sample
+            sample_groups$single[[sample_ids[1]]] <- list(
+                files = sample_info$directory_for_long_read_counts[i],
+                barcode_file = sample_info$barcode_file[i],
+                sex = sample_info$sex[i]
+            )
+        } else {
+            # Rest of the function remains the same
+            sample_rows <- grep(paste(sample_ids, collapse="|"), 
+                              sample_info$id_column_in_short_read_metadata)
+            
+            if(length(sample_rows) > 1) {
+                sample_groups$pooled_multiple[[paste(sample_ids, collapse="|")]] <- list(
+                    files = sample_info$directory_for_long_read_counts[sample_rows],
+                    barcode_files = strsplit(sample_info$barcode_file[sample_rows[1]], "\\|")[[1]],
+                    sample_ids = sample_ids,
+                    sexes = unlist(strsplit(sample_info$sex[sample_rows[1]], "\\|"))
+                )
+            } else {
+                sample_groups$pooled_single[[paste(sample_ids, collapse="|")]] <- list(
+                    files = sample_info$directory_for_long_read_counts[i],
+                    barcode_files = strsplit(sample_info$barcode_file[i], "\\|")[[1]],
+                    sample_ids = sample_ids,
+                    sexes = unlist(strsplit(sample_info$sex[i], "\\|"))
+                )
+            }
+        }
+        processed_samples <- c(processed_samples, sample_ids)
+    }
+    return(sample_groups)
+}
+
+# Processing samples based on their type
+process_samples <- function(sample_groups, short_read_metadata) {
+    seurat_objects <- list()
+    
+    # Processing single samples
+    for(sample_id in names(sample_groups$single)) {
+        info <- sample_groups$single[[sample_id]]
+        seurat_obj <- process_single_sample(info$files, sample_id, short_read_metadata)
+        if(!is.null(seurat_obj)) seurat_objects[[sample_id]] <- seurat_obj
+    }
+    
+    # Processing pooled samples (single run)
+    for(sample_pair in names(sample_groups$pooled_single)) {
+        info <- sample_groups$pooled_single[[sample_pair]]
+        seurat_obj <- process_pooled_sample(
+            count_file = info$files,
+            sample_ids = info$sample_ids,
+            sexes = info$sexes,
+            barcode_files = info$barcode_files,
+            short_read_metadata = short_read_metadata
+        )
+        seurat_objects <- c(seurat_objects, seurat_obj)
+    }
+    
+    # Processing pooled samples (multiple runs)
+    for(sample_pair in names(sample_groups$pooled_multiple)) {
+        info <- sample_groups$pooled_multiple[[sample_pair]]
+        seurat_obj <- process_pooled_multiple_runs(
+            count_files = info$files,
+            sample_ids = info$sample_ids,
+            sexes = info$sexes,
+            barcode_files = info$barcode_files,
+            short_read_metadata = short_read_metadata
+        )
+        seurat_objects <- c(seurat_objects, seurat_obj)
+    }
+    
+    return(seurat_objects)
+}
+
+# Function to process pooled samples with multiple runs
+process_pooled_multiple_runs <- function(count_files, sample_ids, sexes, barcode_files, short_read_metadata) {
+    # Combine counts as before
+    combined_counts <- NULL
+    for(file in count_files) {
+        counts <- fread(file, sep = "\t", header = TRUE, data.table = FALSE)
+        if(is.null(combined_counts)) {
+            combined_counts <- counts
+        } else {
+            # Add counts from additional runs
+            common_rows <- intersect(combined_counts[[1]], counts[[1]])
+            common_cols <- intersect(colnames(combined_counts), colnames(counts))
+            for(col in common_cols[-1]) {
+                combined_counts[match(common_rows, combined_counts[[1]]), col] <- 
+                    combined_counts[match(common_rows, combined_counts[[1]]), col] +
+                    counts[match(common_rows, counts[[1]]), col]
+            }
+        }
+    }
+    
+    # Processing like a normal pooled sample
+    rownames(combined_counts) <- combined_counts[[1]]
+    combined_counts <- combined_counts[,-1]
+    seurat_obj <- CreateSeuratObject(counts = combined_counts)
+    
+    # Assigning cells to samples
+    seurat_obj <- assign_cells_to_samples(
+        seurat_obj, sample_ids, sexes, barcode_files, short_read_metadata
+    )
+    
+    # Spliting and adding metadata
+    seurat_list <- list()
+    for(sample_id in sample_ids) {
+        cells <- colnames(seurat_obj)[seurat_obj$sample_id == sample_id]
+        if(length(cells) > 0) {
+            temp_obj <- seurat_obj[, cells]
+            
+            # Adding metadata
+            filtered_metadata <- short_read_metadata[short_read_metadata$id == sample_id, ]
+            if(nrow(filtered_metadata) > 0) {
+                base_barcodes <- gsub("-\\d+$", "", rownames(filtered_metadata))
+                unique_barcodes <- !duplicated(base_barcodes)
+                filtered_metadata <- filtered_metadata[unique_barcodes, ]
+                rownames(filtered_metadata) <- gsub("-\\d+$", "", rownames(filtered_metadata))
+                
+                common_cells <- intersect(colnames(temp_obj), rownames(filtered_metadata))
+                if(length(common_cells) > 0) {
+                    temp_obj <- AddMetaData(
+                        object = temp_obj,
+                        metadata = filtered_metadata[common_cells, ]
+                    )
+                }
+            }
+            seurat_list[[sample_id]] <- temp_obj
+        }
+    }
+    
+    return(seurat_list)
+}
+```
+
+```{r}
+# Main execution
+sample_groups <- organize_samples(sample_info)
+seurat_objects <- process_samples(sample_groups, short_read_metadata)
+
+valid_samples <- c("1238", "4627", "1224", "3586", "4481", 
+                  "NT1261", "1230", "3329", 
+                  "4482", "4313", "NT1271",
+                  "4305", "4443", "HCTZZT", "HCT17HEX")
+
+# Filtering seurat objects to keep only these exact samples
+filtered_seurat_objects <- list()
+for(name in names(seurat_objects)) {
+    if(name %in% valid_samples) {
+        filtered_seurat_objects[[name]] <- seurat_objects[[name]]
+    }
+}
+
+print("\n=== CELL COUNTS AND METADATA STATUS FOR EACH SAMPLE ===\n")
+for(sample_id in names(filtered_seurat_objects)) {
+    obj <- filtered_seurat_objects[[sample_id]]
+    total_cells <- ncol(obj)
+    has_metadata <- "cluster_celltype" %in% colnames(obj@meta.data)
+    
+    cat(sprintf("Sample %s:\n  Cells: %d\n  Has metadata: %s\n\n", 
+                sample_id, 
+                total_cells, 
+                ifelse(has_metadata, "YES", "NO")))
+}
+
+# Merging all objects
+merged_seurat <- merge(filtered_seurat_objects[[1]], 
+                      y = filtered_seurat_objects[-1], 
+                      add.cell.ids = names(filtered_seurat_objects))
+
+# Adding long read sample ID to metadata
+merged_seurat$long_read_sample_id <- merged_seurat$sample_id
+
+saveRDS(merged_seurat, "AD_main_merged_seurat_obj_gene_level.rds")
+```
