@@ -1,0 +1,206 @@
+Author: Dev Raj Bhattarai
+Date: 2024-11-24
+
+# scNanoseq Analysis Setup
+
+# This repository contains the results after running the nf-core/scnanoseq pipeline (v1.0.0) on UAB's Cheaha HPC system.
+
+## Configuration Files used for the analysis are in /data/project/rizzardilab/drbhatta/long_read/scnanoseq_AD_SC_LR/ directory.
+
+### 1. Parameters File (`params.yaml`)
+Contains the main configuration parameters for the pipeline:
+
+```yaml
+# names/email
+email: "drbhatta@uab.edu"
+multiqc_title: "scnanoseq_AD_SC_LR"
+
+# input/output
+input: "./AD_SC_LR_samplesheet_1.csv"
+outdir: "./results"
+
+# references
+fasta: "/data/project/rizzardilab/drbhatta/long_read/references/GRCh38.primary_assembly.genome.fa"
+gtf: "/data/project/rizzardilab/drbhatta/long_read/references/gencode.v32.annotation.gtf"
+
+# processing options
+skip_bam_nanocomp: true
+min_q_score: 10
+split_amount: 1000000
+
+# barcode options
+whitelist: "/data/project/rizzardilab/drbhatta/737K-arc-v1.txt"
+barcode_format: "10X_3v3"
+```
+
+### 2. Cheaha Configuration (`custom_cheaha.conf`)
+// Define the Scratch directory
+def scratch_dir = System.getenv("USER_SCRATCH") ?: "/tmp"
+
+params {
+    config_profile_name = 'cheaha'
+    config_profile_description = 'University of Alabama at Birmingham Cheaha HPC'
+    config_profile_contact = 'Lara Ianov (lianov@uab.edu) or Austyn Trull (atrull@uab.edu)'
+    config_profile_url = 'https://www.uab.edu/cores/ircp/bds'
+}
+
+env {
+    TMPDIR="$scratch_dir"
+    SINGULARITY_TMPDIR="$scratch_dir"
+}
+
+singularity {
+    enabled = true
+    autoMounts = true
+    runOptions = "--contain --workdir $scratch_dir"
+}
+
+def getQueues = { time, memory ->
+    def queue_list = ["long", "amd-hdr100", "intel-dcb"]
+
+    if (time <= 2.h) {
+        queue_list.add("express")
+    }
+
+    if (time <= 12.h) {
+        queue_list.add("short")
+    }
+
+    if (time <= 50.h) {
+        queue_list.add("medium")
+    }
+
+    if (memory >= 300.GB) {
+        queue_list.add("largemem-long")
+
+        if (time <= 50.h) {
+            queue_list.add("largemem")
+        }
+    }
+
+    return queue_list.join(",")
+}
+
+process {
+    resourceLimits = [
+        memory: 750.GB,
+        cpus: 128,
+        time: 150.h
+    ]
+    executor = 'slurm'
+    maxRetries = 3
+    beforeScript = 'module load Singularity/3.5.2-GCC-5.4.0-2.26'
+    queue = { getQueues( task.time, task.memory ) }
+}
+
+// process specific configs
+process
+{
+    withName: '.*:.*FASTQC.*'
+    {
+        cpus = 25
+    }
+}
+
+process
+{
+    withName: '.*:.*BLAZE.*'
+    {
+        cpus = 45
+        memory = '55.GB'
+    }
+}
+
+
+
+process
+{
+    withName: '.*:TAG_BARCODES'
+    {
+        memory = '160.GB'
+    }
+}
+
+process
+{
+    withName: '.*:SAMTOOLS_SORT'
+    {
+        cpus = 25
+    }
+}
+
+process
+{
+    withName: '.*:PIGZ'
+    {
+        cpus = 35
+    }
+}
+
+process
+{
+    withName: '.*:MINIMAP2_ALIGN'
+    {
+        cpus = 25
+}
+}
+
+process
+{
+    withName: '.*:ISOQUANT'
+    {
+        cpus = 40
+        memory = '125.GB'
+        time = '20.h'
+    }
+}
+
+process
+{
+    withName: '.*:SEURAT_TRANSCRIPT'
+    {
+        memory = '55.GB'
+    }
+}
+
+### 3. Execution Script (`execute_scnanoseq.sh`)
+Bash script to run the pipeline:
+
+```bash
+#!/bin/bash
+
+module load Anaconda3/2021.11
+module load Singularity/3.5.2-GCC-5.4.0-2.26
+
+conda activate long_read
+
+export NXF_SINGULARITY_HOME_MOUNT=true
+export NXF_OPTS='-Xms1g -Xmx4g'
+
+# Create and use scratch directories
+SCRATCH_DIR="$USER_SCRATCH/scnanoseq_work"
+mkdir -p "$SCRATCH_DIR"
+mkdir -p "$USER_SCRATCH/results"
+
+# Execute pipeline
+nextflow run nf-core/scnanoseq \
+    -r 1.0.0 \
+    -params-file ./params.yaml \
+    --outdir "$USER_SCRATCH/results" \
+    -work-dir "$SCRATCH_DIR" \
+    -c custom_cheaha.conf \
+    -resume
+```
+
+## Usage
+
+1. Ensure all configuration files are in the correct locations
+2. Samplesheets 'AD_SC_LR_samplesheet_1.csv' (created using custom script- sample_create.py) also in the directory: /data/project/rizzardilab/drbhatta/long_read/scnanoseq_AD_SC_LR/
+3. Make the execution script executable:
+   ```bash
+   chmod +x execute_scnanoseq.sh
+   ```
+4. Run the pipeline:
+   ```bash
+   ./execute_scnanoseq.sh
+   ```
